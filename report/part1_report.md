@@ -1,244 +1,332 @@
-# Part 1 报告：万科 Production-Oriented DTD Pipeline
+# Part 1 Report: Vanke Production-Oriented DTD Pipeline
 
-## 1. 任务概述
+## 1. Task Overview
 
-CRI提供的万科（China Vanke Co.，A股000002.SZ + H股2202.HK）DTD输入数据
-覆盖2023-12-12至2025-12-12，共493个交易日（8列：`Comp_no`、`Date`、
-`CUR_MKT_CAP(HKD)`、`BS_CUR_LIAB(HKD)`、`BS_LT_BORROW(HKD)`、
-`BS_TOT_LIAB2(HKD)`、`BS_TOT_ASSET(HKD)`、`Risk_Free_Rate`）。
+The Vanke (China Vanke Co., A-share 000002.SZ + H-share 2202.HK) DTD input
+data provided by CRI covers 2023-12-12 to 2025-12-12, 493 trading days in
+total (8 columns: `Comp_no`, `Date`, `CUR_MKT_CAP(HKD)`,
+`BS_CUR_LIAB(HKD)`, `BS_LT_BORROW(HKD)`, `BS_TOT_LIAB2(HKD)`,
+`BS_TOT_ASSET(HKD)`, `Risk_Free_Rate`).
 
-任务要求：
+Task requirements:
 
-1. 在历史数据基础上，补充**至少5个新交易日**的市值和无风险利率数据，
-   资产负债表4列在"没有新财报发布"的假设下结转；
-2. 搭建一套**分阶段、可生产运行**的pipeline（数据摄取 / 转换 / 一致性
-   检查 / 输出），而不是一次性跑完就结束的脚本。
+1. On top of the historical data, supplement market cap and risk-free-rate
+   data for **at least 5 new trading days**, carrying forward the 4
+   balance-sheet columns under the assumption that "no new financial
+   statements are released";
+2. Build a **staged, production-runnable** pipeline (data ingestion /
+   transformation / consistency checks / output), rather than a one-off
+   script that runs once and is done.
 
-本报告分两部分对应这两个要求：第2节说明市值重构和无风险利率的方法论、
-准确性验证；第3节说明每日增量更新pipeline的架构设计。第4节汇总假设与
-已知局限，第5节说明几个明确权衡取舍的设计决定。
+This report is split into two parts corresponding to these two
+requirements: Section 2 covers the methodology and accuracy validation for
+market-cap reconstruction and the risk-free rate; Section 3 covers the
+architecture design of the daily incremental update pipeline. Section 4
+summarizes assumptions and known limitations, and Section 5 covers several
+explicit trade-off decisions.
 
-## 2. 方法论与准确性验证
+## 2. Methodology and Accuracy Validation
 
-### 2.1 市值重构
+### 2.1 Market-Cap Reconstruction
 
-万科同时在深圳（A股）和香港（H股）上市，`CUR_MKT_CAP(HKD)`是两边市值
-按港元合并后的总市值。重构公式：
+Vanke is dual-listed in Shenzhen (A-shares) and Hong Kong (H-shares);
+`CUR_MKT_CAP(HKD)` is the combined market cap of both, converted into HKD.
+Reconstruction formula:
 
 ```
-CUR_MKT_CAP(HKD)（计算值，单位：百万港元）
-    = A股收盘价(CNY) × A股股数 × CNY/HKD汇率
-    + H股收盘价(HKD) × H股股数
+CUR_MKT_CAP(HKD) (computed value, in HKD millions)
+    = A-share closing price (CNY) × A-share count × CNY/HKD FX rate
+    + H-share closing price (HKD) × H-share count
 ```
 
-**数据来源**：A股价格、H股价格、CNY/HKD汇率均取自yfinance
-（ticker分别为`000002.SZ`、`2202.HK`、`CNYHKD=X`）；汇率直连拿不到数据
-时，用`USD/HKD ÷ USD/CNY`交叉汇率兜底。
+**Data sources**: A-share price, H-share price, and the CNY/HKD FX rate are
+all taken from yfinance (tickers `000002.SZ`, `2202.HK`, and `CNYHKD=X`
+respectively); when the direct FX rate is unavailable, a cross rate
+`USD/HKD ÷ USD/CNY` is used as a fallback.
 
-**股本**：A股9,724,196,533股、H股2,206,512,938股，交叉核对了万科
-2023年报~2025三季报四份官方定期报告，在整个计算区间（至2025-12-31）
-内确认为常量。万科B股已于2014年通过"B转H"全部转换为H股，现已无独立
-存续的B股，因此不需要额外的B股市值项。
+**Share count**: 9,724,196,533 A-shares and 2,206,512,938 H-shares, cross-
+checked against four official periodic reports (Vanke's 2023 annual report
+through the 2025 Q3 report) and confirmed constant over the entire
+computation window (through 2025-12-31). Vanke's B-shares were fully
+converted to H-shares via a "B-to-H" conversion in 2014 and no independent
+B-shares remain outstanding, so no separate B-share market-cap term is
+needed.
 
-**准确性验证**：把计算值`CUR_MKT_CAP_CUL(HKD)`与CRI原始数据集里的
-`CUR_MKT_CAP_ORI(HKD)`逐日对比（493个历史交易日全部有对比数据），
-`DIFFERENCE_pct = (CUL - ORI) / ORI × 100`：
+**Accuracy validation**: the computed value `CUR_MKT_CAP_CUL(HKD)` was
+compared day by day against `CUR_MKT_CAP_ORI(HKD)` in CRI's original
+dataset (comparison data available for all 493 historical trading days),
+with `DIFFERENCE_pct = (CUL - ORI) / ORI × 100`:
 
-- 平均/中位数绝对误差在0.1%以内，判定为合理的数据源口径误差（比如
-  收盘价取价时点、汇率来源的细微差异），不需要引入额外调整项；
-- 逐日误差没有系统性偏向某个方向或随时间漂移，说明方法论本身站得住，
-  不是巧合的两天对上。
+- The mean/median absolute error is within 0.1%, judged to be a reasonable
+  data-source convention discrepancy (e.g. minor differences in the closing-
+  price timestamp or FX-rate source), not requiring an additional
+  adjustment term;
+- The day-by-day error shows no systematic bias in either direction and no
+  drift over time, indicating the methodology itself holds up and is not
+  merely matching on a couple of coincidental days.
 
-### 2.2 无风险利率
+### 2.2 Risk-Free Rate
 
-`Risk_Free_Rate`对应香港金管局（HKMA）公开的12个月期Exchange Fund
-Bill孳息率（`efb_364d`字段），接口：
+`Risk_Free_Rate` corresponds to the Hong Kong Monetary Authority's (HKMA)
+publicly available 12-month Exchange Fund Bill yield (the `efb_364d`
+field), endpoint:
 
 ```
 https://api.hkma.gov.hk/public/market-data-and-statistics/
 monthly-statistical-bulletin/efbn/efbn-yield-daily
 ```
 
-**验证**：把HKMA抓到的`efb_364d`跟vanke.xlsx里已有的历史`Risk_Free_Rate`
-逐日对比，取2025-12-04~2025-12-12这7个历史交易日，结果**逐日完全一致**
-（2.55 / 2.55 / 2.48 / 2.50 / 2.53 / 2.50 / 2.46，一位小数都没有差），
-确认HKMA的`efb_364d`就是CRI这一列的数据源。
+**Validation**: the `efb_364d` values fetched from HKMA were compared day
+by day against the historical `Risk_Free_Rate` already present in
+vanke.xlsx, over the 7 historical trading days 2025-12-04 ~ 2025-12-12,
+with the result **matching exactly day by day** (2.55 / 2.55 / 2.48 / 2.50
+/ 2.53 / 2.50 / 2.46, no difference even to one decimal place), confirming
+that HKMA's `efb_364d` is indeed the data source for this CRI column.
 
-**分页方式的一个实操细节**：HKMA接口文档里的`from`/`to`参数在实测中
-不稳定（要么被忽略，要么请求超时），改用`offset`/`pagesize`分页 + 本地
-按日期过滤。抓取几个月前的目标日期时，如果从`offset=0`开始一页页往回
-翻，中途任何一次请求失败就会导致整个函数放弃（实测遇到过`offset=20`
-超时、最终"抓到0条记录"的情况）。改进方案是按目标日期与"今天"之间的
-工作日天数估算一个接近目标的起始offset，把总请求数从十几次压缩到
-一两次，同时给每次请求加上重试+退避。这个改进被同时用在方法论验证
-脚本和`dtd_pipeline`包里。
+**An operational detail on pagination**: the `from`/`to` parameters
+documented for the HKMA endpoint proved unstable in practice (either
+ignored or causing request timeouts), so pagination was switched to
+`offset`/`pagesize` combined with local date filtering. When fetching a
+target date from several months back, paging backward one page at a time
+starting from `offset=0` means any single failed request along the way
+causes the whole function to give up (observed in testing: an `offset=20`
+request timing out, ultimately resulting in "0 records fetched"). The fix
+estimates a starting offset close to the target based on the number of
+business days between the target date and "today," compressing the total
+number of requests from over a dozen down to one or two, while also adding
+retry-with-backoff to each request. This improvement was applied to both
+the methodology validation script and the `dtd_pipeline` package.
 
-### 2.3 资产负债表4列
+### 2.3 The 4 Balance-Sheet Columns
 
-任务书明确假设新增窗口内没有新财报发布，因此`BS_CUR_LIAB(HKD)`、
-`BS_LT_BORROW(HKD)`、`BS_TOT_LIAB2(HKD)`、`BS_TOT_ASSET(HKD)`这4列
-原样结转历史区间最后一天（2025-12-12）的值。实测过去约200个历史交易日，
-这4列总共只变化过5次，对应5次财报发布——跟"两次财报之间保持不变"的
-先验一致，结转处理合理。
+The task explicitly assumes no new financial statements are released
+within the new window, so the 4 columns `BS_CUR_LIAB(HKD)`,
+`BS_LT_BORROW(HKD)`, `BS_TOT_LIAB2(HKD)`, and `BS_TOT_ASSET(HKD)` are
+carried forward unchanged from the last day of the historical window
+(2025-12-12). Checking roughly the past 200 historical trading days, these
+4 columns changed only 5 times in total, each corresponding to a financial-
+statement release — consistent with the prior that "values stay constant
+between two statement releases," confirming the carry-forward treatment is
+reasonable.
 
-但"这段特定窗口不变"不等于"以后也一直不用管"：万科之后还会持续发布
-季报/年报，所以没有把2025-12-12的值直接写死，而是做成跟股本一样的
-checkpoint机制（详见第3节）。
+However, "unchanged within this specific window" does not mean "never
+needs attention again": Vanke will continue to release quarterly/annual
+reports going forward, so rather than hard-coding the 2025-12-12 values,
+they are handled through the same checkpoint mechanism used for share
+count (see Section 3 for details).
 
-## 3. Pipeline架构
+## 3. Pipeline Architecture
 
-### 3.1 两个脚本的分工
+### 3.1 Division of Labor Between the Two Scripts
 
-- **`scripts/ingestion_full.py`**：一次性方法论验证脚本，产出
-  2023-12-12~2025-12-31整段区间（历史493天+新增交易日）的完整数据，
-  并做第2节里的准确性验证。跑一次即可，不需要每天重跑。
-- **`dtd_pipeline/`**：任务书要求的**生产级每日更新pipeline**，每次
-  运行只处理**一个**新交易日，读现有输出表、算出新的一行、追加进去，
-  绝不重新计算或覆盖已有的历史行。
+- **`scripts/ingestion_full.py`**: a one-off methodology validation script
+  that produces the complete 2023-12-12 ~ 2025-12-31 range (493 historical
+  days + new trading days) and performs the accuracy validation described
+  in Section 2. It needs to run once and does not need to be re-run daily.
+- **`dtd_pipeline/`**: the **production-grade daily update pipeline** the
+  task requires — each run processes exactly **one** new trading day,
+  reading the existing output table, computing the new row, and appending
+  it, never recomputing or overwriting existing historical rows.
 
-### 3.2 四个阶段
+### 3.2 Four Stages
 
-| 阶段 | 文件 | 职责 |
+| Stage | File | Responsibility |
 |---|---|---|
-| 数据摄取 (ingestion) | `ingestion.py` | 只管"跟外部要某一天的原始数据"（A股价、H股价、汇率、HKMA利率），不做任何业务判断，拿不到就返回`None` |
-| 转换/计算 (transform) | `transform.py` | checkpoint查表（股本、资产负债表）、carry-forward兜底、市值计算公式、组装成一行 |
-| 一致性检查 (consistency checks) | `validate.py` | errors（日期重复/早于已有数据，会阻止写入）+ warnings（市值单日跳变、利率超出合理区间、数据彻底缺失，只提醒不阻止） |
-| 输出 (output) | `output.py` | 读现有表（或从`vanke.xlsx`bootstrap起点）、验证通过后追加、落盘 |
+| Data ingestion | `ingestion.py` | Solely responsible for "requesting a given day's raw data from external sources" (A-share price, H-share price, FX rate, HKMA rate); makes no business-logic judgments, returns `None` if data can't be obtained |
+| Transformation / computation | `transform.py` | Checkpoint lookups (share count, balance sheet), carry-forward fallback, market-cap computation formula, assembling the row |
+| Consistency checks | `validate.py` | Errors (duplicate date / earlier than existing data, which block the write) + warnings (single-day market-cap jump, rate outside a reasonable range, data entirely missing — these only alert, they don't block) |
+| Output | `output.py` | Reads the existing table (or bootstraps from `vanke.xlsx` as a starting point), appends after validation passes, and persists to disk |
 
-`run_daily_update.py`是编排入口，把四个阶段串起来，命令行用法：
+`run_daily_update.py` is the orchestration entry point that chains the four
+stages together. CLI usage:
 
 ```bash
-python run_daily_update.py                 # 只处理"下一个待处理交易日"
-python run_daily_update.py --days 13       # 连续处理接下来13个候选交易日
-python run_daily_update.py --date 2025-12-15   # 处理指定的某一天
+python run_daily_update.py                 # process only "the next pending trading day"
+python run_daily_update.py --days 13       # process the next 13 candidate trading days consecutively
+python run_daily_update.py --date 2025-12-15   # process a specific given day
 ```
 
-### 3.3 关键设计：carry-forward读自己的产出，不是重新拉历史
+### 3.3 Key Design: Carry-Forward Reads the Pipeline's Own Output, Not a Re-Fetched History
 
-`ingestion_full.py`里"某天缺数据就往回找最近有效值"，是在一个
-**批量拉下来的历史Series**里做的；而`dtd_pipeline`每次只处理一天，往回
-找的对象是**pipeline自己此前已经算好、落盘的输出表**，不是重新发请求
-拉一段历史窗口。这才是"每日增量更新"该有的样子：今天要用的"上一个有效
-值"，来自昨天（或更早）pipeline自己算出来的结果。
+In `ingestion_full.py`, "look backward for the most recent valid value when
+a given day is missing data" is done against a **bulk-fetched historical
+series**; `dtd_pipeline`, on the other hand, processes only one day at a
+time, and what it looks backward against is **the output table the
+pipeline itself has already computed and persisted**, not a re-fetched
+historical window from an external source. This is what "daily incremental
+update" should actually look like: the "last valid value" needed for today
+comes from what the pipeline itself computed yesterday (or earlier), not
+from re-querying history.
 
-### 3.4 is_stale：三态而非二元
+### 3.4 is_stale: Three States, Not Binary
 
-`A_price_is_stale`、`H_price_is_stale`、`Risk_Free_Rate_is_stale`三列
-不是简单的True/False：
+The three columns `A_price_is_stale`, `H_price_is_stale`, and
+`Risk_Free_Rate_is_stale` are not simple True/False:
 
-- `False`：当天抓到了新鲜数据；
-- `True`：当天没有新数据，从输出表里往前借用了前值；
-- `None`：当天没有新数据，往前找也彻底没有——不能写成`False`（那样会
-  误导成"这是新鲜数据"），也不能直接等同于`True`。
+- `False`: fresh data was fetched for that day;
+- `True`: no new data for that day, a prior value was borrowed from the
+  output table;
+- `None`: no new data for that day, and looking backward found nothing at
+  all — this cannot be written as `False` (which would misleadingly imply
+  "this is fresh data"), nor can it simply be treated as equivalent to
+  `True`.
 
-这个三态设计不是一开始就有的，是在测试`dtd_pipeline`时自己发现的一个
-bug（详见第5.3节），修复后`validate.py`也针对`None`这个状态单独加了
-警告，区别于"借用了前值"的情况。
+This three-state design wasn't there from the start — it was a bug
+discovered while testing `dtd_pipeline` (see Section 5.3 for details).
+After the fix, `validate.py` also added a separate warning specifically for
+the `None` state, distinct from the "borrowed a prior value" case.
 
-### 3.5 幂等性与"历史不可修改"
+### 3.5 Idempotency and "History Is Immutable"
 
-`output.py`的`append_row_and_save`只允许在末尾追加，追加前先过一遍
-`validate.py`的检查：日期重复或早于已有数据最新日期，直接拒绝写入并
-抛出异常，不会静默处理，也不会为了"修正"新行而回头改动历史行。这保证
-了pipeline可以安全地被重复调用（比如同一天不小心跑了两次）而不会破坏
-既有数据。
+`output.py`'s `append_row_and_save` only allows appending at the end, and
+runs the `validate.py` checks first: a duplicate date, or one earlier than
+the latest existing date, is rejected outright with an exception raised —
+never handled silently, and never "corrected" by going back and modifying
+historical rows. This ensures the pipeline can be safely called repeatedly
+(e.g. accidentally run twice on the same day) without corrupting existing
+data.
 
-## 4. 假设与局限
+## 4. Assumptions and Limitations
 
-- **股本假设**：假设2025年年报（预计2026年上半年发布）发布前，A股/H股
-  股数不会突然变化。已通过SHARE_CHECKPOINTS机制预留了这一假设失效时
-  的更新入口。
-- **资产负债表假设**：延续任务书"该窗口内无新财报"的假设，通过
-  BS_CHECKPOINTS机制结转最后一次可核实的数字；如果公司在两次财报之间
-  发生临时性变化（增发、债务重组的补充公告），当前的checkpoint机制
-  捕捉不到，需要人工手动加一条临时checkpoint。
-- **交易日日历**：CRI历史数据集实际跟随港交所（HKEX）日历（2023、2024
-  年的12/25、12/26、次年1/1在历史493行里全部缺失，即使A股当天正常
-  开盘）。新增区间**没有**照抄这个口径，详见第5.1节的取舍说明——这是
-  一个明确的、写在这里的偏离，不是疏漏。
-- **停牌个股 vs. 整体休市**：`H_STOCK_PRICE`当天没有新价格时，统一按
-  "港股整体休市"处理并沿用前值；样本区间内没有观察到"大盘开市但万科
-  H股个股单独停牌"的情况，如果未来出现，当前逻辑不会区分这两种情况。
-- **一致性检查的阈值是经验值**：`validate.py`里市值单日变动15%、利率
-  合理区间[0, 20]这些阈值是拍的，不是统计意义上严谨的异常检测，目的
-  是体现"有在防哪些情况"，不是做一套成熟的异常检测系统。
-- **Excel读写的dtype行为**：`*_is_stale`三列在Python里是bool/None混合
-  的三态值，写入Excel再读回来后，pandas/openpyxl会把这种混合列强制
-  转成`float64`（`True/False/None`变成`1.0/0.0/NaN`）。数值含义不变，
-  用`.notna()`/`bool()`转换后能正确解读，这里不特意修复成保留Python
-  bool类型，只是记录这个已知行为。
-- **`next_candidate_date`只跳过周六周日**：不对接真正的港交所/深交所
-  假日日历。公众假期这天会不会被处理，取决于当天A股/H股/HKMA利率是否
-  真的有数据；如果都没有，`validate.py`会打印"两边都stale"的警告，
-  提醒人工判断这天是否真的该算作交易日，但不会自动跳过。
+- **Share-count assumption**: assumes the A-share/H-share counts will not
+  suddenly change before the 2025 annual report (expected in H1 2026) is
+  released. An update entry point for when this assumption breaks has
+  already been reserved via the SHARE_CHECKPOINTS mechanism.
+- **Balance-sheet assumption**: continues the task's stated assumption of
+  "no new financial statements within this window," carrying forward the
+  last verifiable figures via the BS_CHECKPOINTS mechanism; if a temporary
+  change occurs between two statement releases (e.g. a share placement, a
+  supplementary debt-restructuring announcement), the current checkpoint
+  mechanism will not catch it, and a temporary checkpoint would need to be
+  added manually.
+- **Trading-day calendar**: the CRI historical dataset actually follows the
+  Hong Kong Exchange (HKEX) calendar (12/25, 12/26, and 1/1 of the
+  following year for both 2023 and 2024 are entirely absent from the 493
+  historical rows, even though A-shares traded normally on those days). The
+  new window **does not** copy this convention — see the trade-off
+  discussion in Section 5.1: this is an explicit, documented departure, not
+  an oversight.
+- **Suspended single stock vs. market-wide closure**: when `H_STOCK_PRICE`
+  has no new price for a given day, it is uniformly treated as "the Hong
+  Kong market as a whole is closed" and the prior value is carried forward;
+  no case of "the broad market is open but Vanke's H-share specifically is
+  suspended" was observed within the sample window — if this occurs in the
+  future, the current logic will not distinguish between the two cases.
+- **Consistency-check thresholds are empirical**: the thresholds in
+  `validate.py` — a 15% single-day market-cap move, a [0, 20] reasonable
+  range for the rate — are judgment calls, not statistically rigorous
+  anomaly detection; the intent is to demonstrate "what's being guarded
+  against," not to build a mature anomaly-detection system.
+- **Excel read/write dtype behavior**: the three `*_is_stale` columns are a
+  mixed bool/None three-state value in Python; after being written to Excel
+  and read back, pandas/openpyxl forcibly casts this kind of mixed column
+  to `float64` (`True/False/None` become `1.0/0.0/NaN`). The numeric
+  meaning is unchanged and can be correctly interpreted via
+  `.notna()`/`bool()` conversion — this was not specifically fixed to
+  preserve the Python bool type; it is simply noted here as known behavior.
+- **`next_candidate_date` only skips Saturdays and Sundays**: it does not
+  hook into an actual HKEX/SZSE public-holiday calendar. Whether a public
+  holiday gets processed depends on whether A-share/H-share/HKMA-rate data
+  actually exists for that day; if none of them do, `validate.py` will
+  print a "both sides stale" warning, prompting manual judgment on whether
+  that day should really count as a trading day, but it will not be
+  skipped automatically.
 
-## 5. 关键取舍
+## 5. Key Trade-offs
 
-### 5.1 新增区间的交易日定义：不照抄CRI的历史口径
+### 5.1 Trading-Day Definition for the New Window: Not Copying CRI's Historical Convention
 
-核实vanke.xlsx后发现，CRI历史上对"交易日"的定义实际跟随港交所日历，
-而不是"只要有一个市场开盘就算交易日"。本可以照抄这个历史口径（H股
-休市就把整行跳过），但讨论后决定不这样做：12/25、12/26这两天深圳
-明明正常开盘，如果因为港股休市就把这一整行（连同A股当天真实的价格
-变动）一起丢弃，等于让H股的假期"连坐"到了A股头上，损失了本来存在的
-真实信息。
+Upon checking vanke.xlsx, it turns out CRI's historical definition of
+"trading day" actually follows the HKEX calendar, rather than "a day counts
+as a trading day if any one market is open." This historical convention
+could have been copied (skip the entire row when H-shares are closed), but
+after discussion this approach was rejected: on 12/25 and 12/26, Shenzhen
+is clearly open for normal trading — dropping the entire row (along with
+the A-share's genuine price movement that day) just because the Hong Kong
+market is closed would effectively let the H-share holiday "drag down" the
+A-share as well, discarding real information that actually exists.
 
-最终规则：只要有一个市场当天开盘、有真实价格，这一天就保留成一行——
-哪个市场当天没有新价格，就沿用该市场自己上一个收盘价并显式标记
-`is_stale`，不整行丢弃。
+The final rule: as long as at least one market is open that day with a
+real price, that day is kept as a row — whichever market has no new price
+that day simply carries forward its own last closing price with an
+explicit `is_stale` flag, rather than dropping the whole row.
 
-代价：新增区间会出现12/25、12/26这两天的行，而这两个具体日期在CRI
-历史区间（2023、2024年）从来没有出现过对应的行——新增区间和历史区间
-对"交易日"的定义因此不完全一致，这是一个明确权衡后的结果。
+Cost: the new window will include rows for 12/25 and 12/26, dates that
+never had corresponding rows in CRI's historical window (2023, 2024) — so
+the new window's and the historical window's definitions of "trading day"
+are not fully consistent. This is the result of a deliberate, weighed
+trade-off.
 
-**后续补充的例外**：上面这条规则只覆盖"至少一个市场当天开盘"的情况。
-如果A股和H股当天都没有新鲜数据（比如元旦，两地同时休市），保留一行
-"两边全靠借用前值撑出来"的数据意义不大，`ingestion_full.py`
-和`dtd_pipeline/run_daily_update.py`都统一改成了：这种情况直接跳过、
-不生成/不写入这一行。两个脚本用同一条判断标准，避免以后各自独立
-维护、对"这天算不算交易日"给出不一样的答案。
+**A subsequently added exception**: the rule above only covers the case of
+"at least one market open that day." If neither A-shares nor H-shares have
+fresh data on a given day (e.g. New Year's Day, when both markets are
+closed simultaneously), keeping a row that is "entirely propped up by
+borrowed prior values on both sides" has little meaning, so both
+`ingestion_full.py` and `dtd_pipeline/run_daily_update.py` were
+consistently updated to: skip generating/writing that row entirely in this
+case. Both scripts use the same criterion, avoiding a situation where they
+independently evolve and give different answers to "does this day count as
+a trading day" down the line.
 
-### 5.2 checkpoint机制而非硬编码结转
+### 5.2 Checkpoint Mechanism Rather Than Hard-Coded Carry-Forward
 
-资产负债表4列本可以直接写死"结转2025-12-12的值"，对这次的任务范围
-（截至2025-12-31）已经够用。但选择了跟股本同样的checkpoint+人工季度
-维护模式（`BS_CHECKPOINTS`），并加上超过`BS_STALENESS_WARN_DAYS`
-（默认100天）未更新就打印提醒的机制。多花的复杂度换来的是：下次万科
-发布新财报，只需要在列表末尾加一条记录，不需要改任何代码逻辑——这更
-符合"生产pipeline"应该长期运行、而不是为这一次任务量身定制的定位。
+The 4 balance-sheet columns could have simply been hard-coded to "carry
+forward the 2025-12-12 values," which would have been sufficient for this
+task's scope (through 2025-12-31). Instead, the same checkpoint + manual
+quarterly-maintenance pattern used for share count was chosen
+(`BS_CHECKPOINTS`), along with a mechanism that prints a reminder once more
+than `BS_STALENESS_WARN_DAYS` (default 100 days) have passed without an
+update. The extra complexity buys this: the next time Vanke releases a new
+financial statement, only a new record needs to be appended to the list —
+no code logic needs to change. This better fits the intended nature of a
+"production pipeline" that should run indefinitely, rather than being
+custom-built for this one task.
 
-### 5.3 测试中发现并修复的is_stale语义bug
+### 5.3 An is_stale Semantics Bug Found and Fixed During Testing
 
-`dtd_pipeline/transform.py`最初的carry-forward分支写法是：
+The original carry-forward branch in `dtd_pipeline/transform.py` was
+written as:
 
 ```python
 a_stale = a_price is not None
 ```
 
-意图是"借用到前值就标True"，但没考虑到"借用也失败（连输出表里也没有
-更早的值）"这种情况——此时`a_price`是`None`，上面这行会把`a_stale`
-算成`False`，错误地暗示"这是新鲜数据"。测试时自己发现这个问题，改成
-显式区分三态（见3.4节），并在`validate.py`里单独加了对`None`态的
-警告。这类"取反的边界条件"正是加一致性检查阶段的意义所在：如果没有
-`validate.py`对这个状态做单独提示，这个bug可能会一直安静地产出带
-误导性标记的数据。
+The intent was "mark True when a prior value was successfully borrowed,"
+but it didn't account for the case where "the borrow also fails (there's
+no even-earlier value in the output table either)" — in that case
+`a_price` is `None`, and the line above would compute `a_stale` as
+`False`, incorrectly implying "this is fresh data." This was discovered
+during testing and changed to explicitly distinguish three states (see
+Section 3.4), with a separate warning added in `validate.py` specifically
+for the `None` state. This kind of "inverted boundary condition" is
+exactly what having a consistency-checks stage is for: without
+`validate.py` flagging this state separately, this bug could have quietly
+kept producing misleadingly-flagged data indefinitely.
 
-### 5.4 两份checkpoint配置的重复
+### 5.4 Duplication Between the Two Checkpoint Configs
 
-`ingestion_full.py`和`dtd_pipeline/config.py`里各自维护了一份
-`SHARE_CHECKPOINTS`/`BS_CHECKPOINTS`，没有做成共享导入。这是一个接受
-的重复，原因是两者职责边界清晰（前者是一次性验证脚本，后者是持续运行
-的生产模块），强行共享会引入不必要的模块间依赖；代价是未来更新
-checkpoint时需要人工同步改两处，这一点写在`dtd_pipeline/config.py`
-注释里作为已知维护成本。
+`ingestion_full.py` and `dtd_pipeline/config.py` each maintain their own
+copy of `SHARE_CHECKPOINTS`/`BS_CHECKPOINTS`, rather than sharing them via
+a common import. This duplication is accepted, because the two have
+clearly separated responsibilities (the former is a one-off validation
+script, the latter a continuously-running production module), and forcing
+them to share would introduce an unnecessary inter-module dependency; the
+cost is that future checkpoint updates need to be manually synced in both
+places, which is noted in a comment in `dtd_pipeline/config.py` as a known
+maintenance cost.
 
-## 6. 小结
+## 6. Summary
 
-市值重构方法用两年历史数据逐日验证，平均/中位数误差在0.1%以内；
-无风险利率的数据源（HKMA `efb_364d`）用7个历史交易日逐日核对完全一致；
-资产负债表结转沿用任务书给定假设，并预留了未来财报更新的接口。在此
-基础上搭建的`dtd_pipeline`包按数据摄取/转换/一致性检查/输出四个阶段
-分离，核心设计是carry-forward读pipeline自己的历史产出而非重新拉取
-外部历史数据，具备幂等性（拒绝重复/乱序追加）和显式的三态数据新鲜度
-标记，并通过端到端测试验证了bootstrap、连续多日处理、幂等性拒绝等
-场景。
+The market-cap reconstruction method was validated day by day against two
+years of historical data, with mean/median error within 0.1%; the risk-
+free-rate data source (HKMA's `efb_364d`) was cross-checked day by day
+against 7 historical trading days and matched exactly; the balance-sheet
+carry-forward follows the assumption given in the task and reserves a hook
+for future statement updates. Built on this foundation, the
+`dtd_pipeline` package is separated into four stages — data ingestion /
+transformation / consistency checks / output — with its core design being
+carry-forward that reads the pipeline's own historical output rather than
+re-fetching external history, idempotency (rejecting duplicate/out-of-order
+appends), and explicit three-state data-freshness flags, validated through
+end-to-end tests covering scenarios such as bootstrapping, processing
+multiple consecutive days, and idempotency rejection.
